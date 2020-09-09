@@ -1,0 +1,166 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description: SSM State Association to install Trend Micro
+Parameters:
+
+  pPolicyId:
+      Description: The customer Policy ID for Trend Micro
+      Type: String
+  pActivationUrl:
+      Description: The Activation URL for Trend Micro central server
+      Type: String
+  pManagerUrl:
+      Description: The Manager URL for Trend Micro central server
+      Type: String
+
+
+Resources:
+  rSsmTrendmicroLinux:
+    Type: AWS::SSM::Association
+    Properties:
+      ScheduleExpression: "rate(1 hour)"
+      AssociationName: Linux-TrendMicro
+      Name: AWS-RunShellScript
+      Parameters:
+        commands:
+          - !Sub |
+              #!/bin/bash
+
+              ACTIVATIONURL='${pActivationUrl}'
+              MANAGERURL='${pManagerUrl}'
+              CURLOPTIONS='--silent --tlsv1.2'
+              linuxPlatform='';
+              isRPM='';
+              service=ds_agent
+              # check if service is running and already installed
+              if (( $(ps -ef | grep -v grep | grep $service | wc -l) > 0 ))
+              then
+                logger -t "service is installed and running"
+                echo "TM Deep Security service is already installed and successfully running"
+                exit 0
+              fi;
+
+              if [[ $(/usr/bin/id -u) -ne 0 ]]; then
+                  echo You are not running as the root user.  Please try again with root privileges.;
+                  logger -t You are not running as the root user.  Please try again with root privileges.;
+                  exit 1;
+              fi;
+              if ! type curl >/dev/null 2>&1; then
+                  echo "Please install CURL before running this script."
+                  logger -t Please install CURL before running this script
+                  exit 1
+              fi
+              curl $MANAGERURL/software/deploymentscript/platform/linuxdetectscriptv1/ -o /tmp/PlatformDetection $CURLOPTIONS --insecure
+              if [ -s /tmp/PlatformDetection ]; then
+                  . /tmp/PlatformDetection
+              else
+                  echo "Failed to download the agent installation support script."
+                  logger -t Failed to download the Deep Security Agent installation support script
+                  exit 1
+              fi
+              platform_detect
+              if [[ -z "/${!linuxPlatform}" ]] || [[ -z "/${!isRPM}" ]]; then
+                  echo Unsupported platform is detected
+                  logger -t Unsupported platform is detected
+                  exit 1
+              fi
+              echo Downloading agent package...
+              if [[ $isRPM == 1 ]]; then package='agent.rpm'
+                  else package='agent.deb'
+              fi
+              curl -H "Agent-Version-Control: on" $MANAGERURL/software/agent//${!runningPlatform}/${!majorVersion}//${!archType}/$package?tenantID= -o /tmp/$package $CURLOPTIONS --insecure
+              echo Installing agent package...
+              rc=1
+              if [[ $isRPM == 1 && -s /tmp/agent.rpm ]]; then
+                  rpm -ihv /tmp/agent.rpm
+                  rc=$?
+              elif [[ -s /tmp/agent.deb ]]; then
+                  dpkg -i /tmp/agent.deb
+                  rc=$?
+              else
+                  echo Failed to download the agent package. Please make sure the package is imported in the Deep Security Manager
+                  logger -t Failed to download the agent package. Please make sure the package is imported in the Deep Security Manager
+                  exit 1
+              fi
+              if [[ /${!rc} != 0 ]]; then
+                  echo Failed to install the agent package
+                  logger -t Failed to install the agent package
+                  exit 1
+              fi
+              echo Install the agent package successfully
+              sleep 15
+              /opt/ds_agent/dsa_control -r
+              /opt/ds_agent/dsa_control -a $ACTIVATIONURL "policyid:${pPolicyId}"
+              fi
+
+      WaitForSuccessTimeoutSeconds: 300
+      Targets:
+        - Key: tag:trendmicro
+          Values:
+            - 'linux'
+
+  rSsmTrendmicroWindows:
+    Type: AWS::SSM::Association
+    Properties:
+      ScheduleExpression: "rate(1 hour)"
+      AssociationName: Windows-TrendMicro
+      Name: AWS-RunPowerShellScript
+      Parameters:
+        commands:
+          - !Sub |
+              #requires -version 4.0
+              # PowerShell 4 or up is required to run this script
+              # This script detects platform and architecture. It then downloads and installs the relevant Deep Security Agent package
+              if (-NOT ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
+                Write-Warning "You are not running as an Administrator. Please try again with admin privileges."
+                exit 1
+              }
+              # check to see if service is running and already installed
+              if(Get-Service ds_agent -ErrorAction SilentlyContinue) {
+                echo "ds_agent service found...exiting installation process."
+                exit 0
+              }
+              else {
+                echo "ds_agent service not found...preparing to install"
+              }
+
+              $ACTIVATIONURL="${pActivationUrl}"
+              $managerUrl="${pManagerUrl}"
+
+              $env:LogPath = "$env:appdata\Trend Micro\Deep Security Agent\installer"
+              New-Item -path $env:LogPath -type directory
+              Start-Transcript -path "$env:LogPath\dsa_deploy.log" -append
+              echo "$(Get-Date -format T) - DSA download started"
+              if ( [intptr]::Size -eq 8 ) {
+                $sourceUrl=-join($managerUrl, "software/agent/Windows/x86_64/agent.msi") }
+              else {
+                $sourceUrl=-join($managerUrl, "software/agent/Windows/i386/agent.msi") }
+              echo "$(Get-Date -format T) - Download Deep Security Agent Package" $sourceUrl
+
+              $WebClient = New-Object System.Net.WebClient
+              # Add agent version control info
+              $WebClient.Headers.Add("Agent-Version-Control", "on")
+              $WebClient.QueryString.Add("tenantID", "")
+              $WebClient.QueryString.Add("windowsVersion", (Get-CimInstance Win32_OperatingSystem).Version)
+              $WebClient.QueryString.Add("windowsProductType", (Get-CimInstance Win32_OperatingSystem).ProductType)
+              [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12;
+              [Net.ServicePointManager]::ServerCertificateValidationCallback = {$true}
+              $WebClient.DownloadFile($sourceUrl,  "$env:temp\agent.msi")
+              if ( (Get-Item "$env:temp\agent.msi").length -eq 0 ) {
+                  echo "Failed to download the Deep Security Agent. Please check if the package is imported into the Deep Security Manager. "
+              exit 1
+              }
+              echo "$(Get-Date -format T) - Downloaded File Size:" (Get-Item "$env:temp\agent.msi").length
+              echo "$(Get-Date -format T) - DSA install started"
+              echo "$(Get-Date -format T) - Installer Exit Code:" (Start-Process -FilePath msiexec -ArgumentList "/i $env:temp\agent.msi /qn ADDLOCAL=ALL /l*v `"$env:LogPath\dsa_install.log`"" -Wait -PassThru).ExitCode
+              echo "$(Get-Date -format T) - DSA activation started"
+              Start-Sleep -s 50
+              & $Env:ProgramFiles"\Trend Micro\Deep Security Agent\dsa_control" -r
+              & $Env:ProgramFiles"\Trend Micro\Deep Security Agent\dsa_control" -a $ACTIVATIONURL "policyid:${pPolicyId}"
+              Stop-Transcript
+              echo "$(Get-Date -format T) - DSA Deployment Finished"
+      WaitForSuccessTimeoutSeconds: 300
+      Targets:
+        - Key: tag:trendmicro
+          Values:
+            - 'windows'
